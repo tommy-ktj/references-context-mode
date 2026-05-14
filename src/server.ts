@@ -101,6 +101,20 @@ writeFileSync(
 let _store: ContentStore | null = null;
 
 /**
+ * Build the FK-attribution object passed to every ContentStore.index*() call
+ * in this process. CLAUDE_SESSION_ID is the only MCP-side handle we have on
+ * the current session — eventId stays undefined because MCP tool invocations
+ * are not paired with PostToolUse event rows at index time (the hook fires
+ * AFTER the tool returns). Empty-string fallback inside #insertChunks keeps
+ * legacy unattributed rows readable.
+ */
+function currentAttribution(): { sessionId?: string } | undefined {
+  const sessionId = process.env.CLAUDE_SESSION_ID;
+  if (!sessionId) return undefined;
+  return { sessionId };
+}
+
+/**
  * Auto-index session events files written by SessionStart hook.
  * Scans ~/.claude/context-mode/sessions/ for *-events.md files.
  * CLAUDE_PROJECT_DIR is NOT available to MCP servers — only to hooks —
@@ -116,7 +130,7 @@ function maybeIndexSessionEvents(store: ContentStore): void {
     for (const file of files) {
       const filePath = join(sessionsDir, file);
       try {
-        store.index({ path: filePath, source: "session-events" });
+        store.index({ path: filePath, source: "session-events", attribution: currentAttribution() });
         unlinkSync(filePath);
       } catch { /* best-effort per file */ }
     }
@@ -1315,7 +1329,7 @@ function indexStdout(
 ): { content: Array<{ type: "text"; text: string }> } {
   const store = getStore();
   trackIndexed(Buffer.byteLength(stdout));
-  const indexed = store.index({ content: stdout, source });
+  const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
   return {
     content: [
       {
@@ -1344,7 +1358,7 @@ function intentSearch(
 
   // Index into the PERSISTENT store so user can ctx_search() later
   const persistent = getStore();
-  const indexed = persistent.indexPlainText(stdout, source);
+  const indexed = persistent.indexPlainText(stdout, source, undefined, currentAttribution());
 
   // Search the persistent store directly (porter → trigram → fuzzy)
   let results = persistent.searchWithFallback(intent, maxResults, source);
@@ -1611,7 +1625,7 @@ server.registerTool(
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
+      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath, attribution: currentAttribution() });
 
       return trackResponse("ctx_index", {
         content: [
@@ -2383,13 +2397,14 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
   // `source` label do not overwrite each other (commit 1f1243e). ctx_search()
   // still finds both via LIKE-mode source filter on the `source` substring.
   const storageLabel = composeFetchCacheKey(f.source, f.url);
+  const attribution = currentAttribution();
   let indexed: IndexResult;
   if (f.header === "__CM_CT__:json") {
-    indexed = store.indexJSON(f.markdown, storageLabel);
+    indexed = store.indexJSON(f.markdown, storageLabel, undefined, attribution);
   } else if (f.header === "__CM_CT__:text") {
-    indexed = store.indexPlainText(f.markdown, storageLabel);
+    indexed = store.indexPlainText(f.markdown, storageLabel, undefined, attribution);
   } else {
-    indexed = store.index({ content: f.markdown, source: storageLabel });
+    indexed = store.index({ content: f.markdown, source: storageLabel, attribution });
   }
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
   trackIndexed(Buffer.byteLength(f.markdown));
@@ -2751,7 +2766,7 @@ server.registerTool(
         .map((c) => c.label)
         .join(",")
         .slice(0, 80)}`;
-      const indexed = store.index({ content: stdout, source });
+      const indexed = store.index({ content: stdout, source, attribution: currentAttribution() });
 
       // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
       const allSections = store.getChunksBySource(indexed.sourceId);
@@ -3169,7 +3184,12 @@ server.registerTool(
 // files (events.md, FTS5 store file, stats file) are preserved.
 // Passing both sessionId AND scope:"project" is ambiguous (does the
 // caller want a per-session wipe or a project-wide one?) and is
-// rejected by the schema's refine().
+// rejected by an explicit check in the handler body — NOT a schema-level
+// .refine(). MCP SDK's normalizeObjectSchema() reads `.shape` to project
+// inputSchema → JSON Schema for tools/list; a ZodEffects (refine wrapper)
+// has no `.shape`, so the SDK silently emits `properties: {}`, and Claude
+// Code's strict-input-validation gate then rejects EVERY call to this
+// tool with "input_schema does not support fields". Issue #563.
 server.registerTool(
   "ctx_purge",
   {
@@ -3193,6 +3213,9 @@ server.registerTool(
       "Use sessionId when the user asks to clear a specific conversation's data.\n" +
       "Use scope:'project' ONLY when the user explicitly asks to reset everything.\n" +
       "NEVER call with bare {confirm:true} — always specify the scope.",
+    // NOTE: schema MUST be a plain z.object — no .refine()/.transform()/
+    // .superRefine() wrapper. See block comment above & issue #563. The
+    // cross-field ambiguity check lives in the handler body below.
     inputSchema: z.object({
       confirm: z.boolean().describe(
         "MUST be true. Destructive operation; false returns 'purge cancelled'."
@@ -3207,16 +3230,24 @@ server.registerTool(
         "the entire project (FTS5 + every session + stats). Omit only for the " +
         "deprecated bare-{confirm:true} back-compat path."
       ),
-    }).refine(
-      (v) => !(v.sessionId && v.scope === "project"),
-      {
-        message: "Ambiguous purge: sessionId implies scope:'session', cannot combine with scope:'project'. " +
-          "Use scope:'project' WITHOUT sessionId for the legacy whole-project wipe.",
-        path: ["scope"],
-      },
-    ),
+    }),
   },
   async ({ confirm, sessionId, scope }) => {
+    // Cross-field ambiguity check — formerly a schema .refine(), moved
+    // into the handler so the inputSchema stays a plain ZodObject and
+    // the MCP SDK can serialize `.shape` into JSON Schema (issue #563).
+    // Same human-readable message as the original refine() preserved.
+    if (sessionId && scope === "project") {
+      return trackResponse("ctx_purge", {
+        content: [{
+          type: "text" as const,
+          text:
+            "Ambiguous purge: sessionId implies scope:'session', cannot combine with scope:'project'. " +
+            "Use scope:'project' WITHOUT sessionId for the legacy whole-project wipe.",
+        }],
+        isError: true,
+      });
+    }
     if (!confirm) {
       return trackResponse("ctx_purge", {
         content: [{

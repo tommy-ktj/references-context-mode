@@ -2548,9 +2548,45 @@ describe("ctx_purge scoped handler (issue #520)", () => {
   });
 
   // Slice 6 — schema rejects {confirm, sessionId, scope:"project"} (ambiguous).
-  test("slice 6: schema refuses ambiguous {sessionId + scope:'project'}", () => {
-    // Implemented via z.object(...).refine(...) on the inputSchema.
-    expect(purgeBody).toMatch(/\.refine\(/);
+  // The MCP SDK's normalizeObjectSchema() requires a plain ZodObject so it
+  // can read `.shape` when serializing inputSchema → JSON Schema for
+  // tools/list. A `.refine()` wrapper produces a ZodEffects which has no
+  // `.shape`, so the SDK falls back to `properties: {}` — and Claude Code's
+  // strict-input-validation gate then rejects the tool call before the
+  // handler ever runs. Issue #563.
+  //
+  // Therefore the cross-field check MUST live in the handler body, not on
+  // the schema. Verify (a) the inputSchema is NOT wrapped in refine() and
+  // (b) the handler still rejects the ambiguous combo at runtime.
+  test("slice 6: inputSchema is plain z.object — no .refine/.transform/.superRefine wrapper (#563)", () => {
+    // Locate the inputSchema literal (between `inputSchema:` and the next
+    // top-level handler comma `},`). Anchor narrowly so we only inspect
+    // the schema, not the handler body that legitimately contains checks.
+    const schemaStart = purgeBody.indexOf("inputSchema:");
+    expect(schemaStart).toBeGreaterThan(-1);
+    // The schema literal ends at the matching close of registerTool's
+    // options object — i.e. just before `},\n  async (`.
+    const handlerStart = purgeBody.indexOf("async ({");
+    expect(handlerStart).toBeGreaterThan(schemaStart);
+    const schemaSlice = purgeBody.slice(schemaStart, handlerStart);
+    expect(schemaSlice).not.toMatch(/\.refine\(/);
+    expect(schemaSlice).not.toMatch(/\.superRefine\(/);
+    expect(schemaSlice).not.toMatch(/\.transform\(/);
+  });
+
+  test("slice 6b: handler rejects ambiguous {sessionId + scope:'project'} at runtime (#563)", () => {
+    // The cross-field ambiguity check moved out of the schema into the
+    // handler body. Verify a guard exists that fires when sessionId is
+    // present AND scope === "project", and that it returns isError:true
+    // rather than throwing.
+    const handlerSlice = purgeBody.slice(purgeBody.indexOf("async ({"));
+    expect(handlerSlice).toMatch(
+      /sessionId\s*&&\s*scope\s*===\s*["']project["']|scope\s*===\s*["']project["']\s*&&\s*sessionId/,
+    );
+    expect(handlerSlice).toMatch(/isError:\s*true/);
+    // Human-readable message preserved (matches the original refine() text
+    // so consumers see the same guidance).
+    expect(handlerSlice).toMatch(/[Aa]mbiguous/);
   });
 
   // Slice 7 — schema accepts {confirm:true, sessionId:"<uuid>"}.
@@ -2564,6 +2600,50 @@ describe("ctx_purge scoped handler (issue #520)", () => {
   // handler — not the deep module — to keep purge.ts pure.
   test("slice 8: handler emits deprecation warning when scope+sessionId both omitted", () => {
     expect(purgeBody).toMatch(/console\.warn\([^)]*deprecat/i);
+  });
+
+  // Slice 9 (#563 regression — class-wide guard) — NO registered MCP tool
+  // may wrap its inputSchema in .refine(), .superRefine(), or .transform().
+  // All three produce a ZodEffects, which the MCP SDK's
+  // normalizeObjectSchema() does not recognize (it reads `.shape`), so the
+  // serialized JSON Schema collapses to `properties: {}` — and Claude Code
+  // (and any strict-input client) then refuses every call to that tool
+  // with "input_schema does not support fields". Move cross-field checks
+  // into the handler body. This test catches the entire class for ALL
+  // registered tools, not just ctx_purge.
+  test("slice 9: all registered MCP tools must have non-empty input schema (regression for #563)", () => {
+    // Match every registerTool(...) block — same anchor pattern used by
+    // the per-tool slices above. Greedy [\s\S]*? + line-anchored ^);
+    // terminator = the body of one registerTool call.
+    const blocks = [
+      ...serverSrc.matchAll(
+        /server\.registerTool\(\s*"([^"]+)"[\s\S]*?^\);/gm,
+      ),
+    ];
+    expect(blocks.length).toBeGreaterThan(5);
+
+    const violations: string[] = [];
+    for (const m of blocks) {
+      const name = m[1];
+      const body = m[0];
+      // Isolate just the inputSchema literal (between `inputSchema:` and
+      // the start of the handler arrow `async (`). Tools without an
+      // inputSchema (none currently) are skipped silently.
+      const sIdx = body.indexOf("inputSchema:");
+      if (sIdx < 0) continue;
+      const hIdx = body.indexOf("async (", sIdx);
+      const schemaSlice = hIdx > sIdx ? body.slice(sIdx, hIdx) : body.slice(sIdx);
+      if (/\.refine\(/.test(schemaSlice)) violations.push(`${name}: .refine()`);
+      if (/\.superRefine\(/.test(schemaSlice)) violations.push(`${name}: .superRefine()`);
+      if (/\.transform\(/.test(schemaSlice)) violations.push(`${name}: .transform()`);
+    }
+    expect(
+      violations,
+      "ZodEffects on inputSchema breaks MCP SDK normalizeObjectSchema → JSON " +
+        "Schema collapses to properties:{} → Claude Code rejects with " +
+        "'input_schema does not support fields'. Move cross-field checks into " +
+        "the handler body. See issue #563.",
+    ).toEqual([]);
   });
 });
 

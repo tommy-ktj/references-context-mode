@@ -30,13 +30,26 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import {
+  existsSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const REPO_ROOT = resolve(__dirname, "..");
+// Realpath-canonicalize REPO_ROOT so START_MJS is anchored to the on-disk
+// path regardless of symlinked test invocations (#568 follow-up). Without
+// this, a vitest run reached via a symlinked worktree alias produces a
+// non-canonical START_MJS string; spawned decoy children inherit that
+// string as argv, and the production POSIX_PGREP_PATTERN — which matches
+// canonical install shapes — fails to discover them.
+const REPO_ROOT = realpathSync(resolve(__dirname, ".."));
 const START_MJS = resolve(REPO_ROOT, "start.mjs");
 const BUNDLE = resolve(REPO_ROOT, "server.bundle.mjs");
 
@@ -58,6 +71,29 @@ describe.skipIf(!RUN)("lifecycle e2e — real binary (#565)", () => {
       // Vitest's `.skipIf` already skips, but emit a helpful hint to stderr.
       const reason = !POSIX ? "non-POSIX host" : "bundle missing — run `npm run build`";
       process.stderr.write(`[lifecycle-e2e] skipped: ${reason}\n`);
+    }
+  });
+
+  it("realpath guard canonicalizes symlinked worktree paths (#568 follow-up)", () => {
+    // Replicates the path-fragility scenario: a test loader reaching this
+    // file via a symlinked alias would otherwise compute a non-canonical
+    // REPO_ROOT, and decoy children spawned with that path get an argv
+    // that the production POSIX_PGREP_PATTERN can't match. Asserts the
+    // realpath-canonicalization at module load survives a symlink alias.
+    const tmpRoot = mkdtempSync(join(tmpdir(), "cm-realpath-fragility-"));
+    const symAlias = join(tmpRoot, "alias");
+    try {
+      symlinkSync(REPO_ROOT, symAlias, "dir");
+      const symlinkedStartMjs = join(symAlias, "start.mjs");
+      // Symlink alias resolves back to the canonical START_MJS.
+      expect(realpathSync(symlinkedStartMjs)).toBe(START_MJS);
+      // REPO_ROOT itself is canonical — fixed point under realpath.
+      expect(REPO_ROOT).toBe(realpathSync(REPO_ROOT));
+      // START_MJS is canonical too (defends against future regressions
+      // where a contributor reverts the realpath guard at module load).
+      expect(START_MJS).toBe(realpathSync(START_MJS));
+    } finally {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* */ }
     }
   });
 

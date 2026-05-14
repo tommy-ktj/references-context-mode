@@ -213,4 +213,35 @@ describe("heal-better-sqlite3.mjs — Windows VS year detection (VS 2026+)", () 
   it("buildSafeEnv only sets npm_config_msvs_version when not already present", () => {
     expect(HEAL_SRC).toMatch(/!\s*env\.npm_config_msvs_version/);
   });
+
+  // ── Follow-up (ARCH-REVIEW Part B #2 + #3): timeout 15s + year sanity cap ──
+  // 1. Slow Windows CI/HDD vswhere queries can exceed 5s — bump to 15s.
+  // 2. Any year > currentYear+5 indicates corrupted vswhere output or future
+  //    MS rebrand; fail loud (return null + stderr) instead of silently
+  //    poisoning npm_config_msvs_version with bogus "2099".
+  it("uses a 15s vswhere timeout and rejects years beyond currentYear+5", async () => {
+    // (a) Source contract: timeout literal must be 15000ms, not 5000.
+    expect(HEAL_SRC).toMatch(/timeout:\s*15000/);
+    expect(HEAL_SRC).not.toMatch(/timeout:\s*5000/);
+
+    // (b) Behavioral contract: years > currentYear+5 are rejected → null.
+    const { detectWindowsVsYear } = await import(
+      "../../scripts/heal-better-sqlite3.mjs"
+    );
+    const bogusYear = String(new Date().getFullYear() + 10);
+    expect(detectWindowsVsYear({
+      platform: "win32",
+      existsSync: () => true,
+      exec: () => `Visual Studio Community ${bogusYear}`,
+    })).toBeNull();
+
+    // Sanity: a year within the +5 envelope is still accepted (this is what
+    // distinguishes a real cap from a hardcoded current-year reject).
+    const futureOkYear = String(new Date().getFullYear() + 3);
+    expect(detectWindowsVsYear({
+      platform: "win32",
+      existsSync: () => true,
+      exec: () => `Visual Studio Community ${futureOkYear}`,
+    })).toBe(futureOkYear);
+  });
 });

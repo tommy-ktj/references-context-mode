@@ -32,24 +32,7 @@ import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { AdapterPlatformType, OpenCodeAdapter } from "./index.js";
 import { PLATFORM_ENV_VARS } from "../detect.js";
-
-// Read package.json version once at module load (not on every hook call).
-// Used in the resume-injection visible signal so users can confirm in
-// OPENCODE_DEBUG logs which plugin version actually injected.
-const VERSION: string = (() => {
-  try {
-    const pkgRoot = dirname(fileURLToPath(import.meta.url));
-    // Search both the legacy depths (when bundled flat under build/) and
-    // the post-refactor depths (when compiled to build/adapters/opencode/).
-    // `../../../package.json` is the canonical location after the
-    // `src/opencode-plugin.ts → src/adapters/opencode/plugin.ts` move.
-    for (const rel of ["../../../package.json", "../package.json", "./package.json"]) {
-      const p = resolve(pkgRoot, rel);
-      if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8")).version ?? "unknown";
-    }
-  } catch { /* fall through */ }
-  return "unknown";
-})();
+import { zod3ShapeToV4 } from "./zod3tov4.js";
 
 // ── Types ─────────────────────────────────────────────────
 
@@ -424,9 +407,13 @@ async function createContextModePlugin(ctx: PluginContext) {
             ? (inputSchema._def.shape as () => unknown)()
             : {};
 
+      const argsForHost = platform === "kilo"
+        ? zod3ShapeToV4(shape as Record<string, unknown>)
+        : shape as Record<string, unknown>;
+
       tools[registered.name] = {
         description: String(config.description ?? ""),
-        args: shape as Record<string, unknown>,
+        args: argsForHost,
         async execute(args: Record<string, unknown>, toolCtx: NativeToolContext) {
           toolCtx.metadata?.({ title: String(config.title ?? registered.name) });
           const project = toolCtx.directory || projectDir;

@@ -1,123 +1,170 @@
 /**
- * Issue #9 (updated PRD) — extractUserPromptFeatures per F1 spec.
+ * Issue #5 + #8 (Layer 3) — extractUserPromptFeatures per §11.
  *
  * Reference: context-mode-platform/docs/prds/2026-06-insight-data-flow/
- *   09-oss-handoff-prd.md Issue #9 (interface PromptFeatures)
- *   10-prompt-analytics-strategy.md §2 (signal list) + §5 (typed columns)
+ *   11-multilingual-prompt-algorithm.md §11 Layer 1 + Layer 3
  *
- * Returns the 5-field F1-canonical shape (platform typed columns):
- *   prompt_length: number
- *   prompt_first_word: string (lowercased, max 32 chars)
- *   prompt_question_count: number
- *   prompt_file_ref_count: number (identifiers like foo.ts / bar.py)
- *   prompt_path_ref_count: number (paths starting with src/tests/docs/scripts/hooks/packages)
+ * The §11 spec mandates Unicode property regex (`\p{L}`, `\p{Lu}`,
+ * `\p{Script=X}`) — script-agnostic, no per-language tables, no
+ * franc/fasttext/compromise dependencies. Output is 10 numeric/string
+ * features + one `prompt_word_tokens: string[]` array (Layer 3).
  *
- * NEVER stores raw prompt text on the returned object — features only.
+ * Privacy: per §11 the features carry no prompt prose. Layer 3 tokens
+ * are letter-only words ≥3 chars, lowercased, deduplicated — they may
+ * include words from the prompt but the platform's prompt_word_count
+ * table aggregates these by (org_id, week, word) so individual tokens
+ * never surface in the UI.
  */
 
 import { describe, test, expect } from "vitest";
 import { extractUserPromptFeatures } from "../../src/session/extract.js";
 
-describe("extractUserPromptFeatures — F1 §2 spec", () => {
-  test("tracer: empty prompt → all zeros + empty first_word", () => {
+describe("extractUserPromptFeatures — §11 Layer 1 (10 features)", () => {
+  test("tracer: empty prompt → all zeros + null script + empty tokens", () => {
     const f = extractUserPromptFeatures("");
     expect(f.prompt_length).toBe(0);
-    expect(f.prompt_first_word).toBe("");
-    expect(f.prompt_question_count).toBe(0);
+    expect(f.prompt_word_count).toBe(0);
+    expect(f.prompt_uppercase_ratio).toBe(0);
     expect(f.prompt_file_ref_count).toBe(0);
     expect(f.prompt_path_ref_count).toBe(0);
+    expect(f.prompt_script_primary).toBeNull();
+    expect(f.prompt_script_count).toBe(0);
+    expect(f.prompt_question_glyph_count).toBe(0);
+    expect(f.prompt_code_block_count).toBe(0);
+    expect(f.prompt_url_count).toBe(0);
+    expect(f.prompt_word_tokens).toEqual([]);
   });
 
-  test("English imperative: first_word + length + file ref", () => {
-    const f = extractUserPromptFeatures("Add login page with OAuth flow at src/auth.ts");
-    expect(f.prompt_first_word).toBe("add");
-    expect(f.prompt_length).toBeGreaterThan(20);
-    expect(f.prompt_file_ref_count).toBeGreaterThanOrEqual(1);
-    expect(f.prompt_path_ref_count).toBeGreaterThanOrEqual(1);
+  test("Latin script primary on English prompt", () => {
+    const f = extractUserPromptFeatures("Refactor the auth module please");
+    expect(f.prompt_script_primary).toBe("Latin");
+    expect(f.prompt_script_count).toBe(1);
+    expect(f.prompt_word_count).toBeGreaterThan(0);
   });
 
-  test("first_word lowercased", () => {
-    expect(extractUserPromptFeatures("REFACTOR auth").prompt_first_word).toBe("refactor");
-    expect(extractUserPromptFeatures("Why is this slow?").prompt_first_word).toBe("why");
+  test("Han script primary on Chinese prompt", () => {
+    const f = extractUserPromptFeatures("中文测试 重构");
+    expect(f.prompt_script_primary).toBe("Han");
   });
 
-  test("first_word capped at 32 chars", () => {
-    const veryLongFirstWord = "a".repeat(80) + " rest of prompt";
-    const f = extractUserPromptFeatures(veryLongFirstWord);
-    expect(f.prompt_first_word.length).toBeLessThanOrEqual(32);
+  test("Hangul script primary on Korean prompt", () => {
+    const f = extractUserPromptFeatures("한국어 테스트");
+    expect(f.prompt_script_primary).toBe("Hangul");
   });
 
-  test("question count: multi-question Turkish prompt", () => {
-    const f = extractUserPromptFeatures("Bu kod neden patladı? Nerede hata var? Ne yapmalıyız?");
-    expect(f.prompt_question_count).toBe(3);
+  test("Cyrillic script primary on Russian prompt", () => {
+    const f = extractUserPromptFeatures("Привет мир рефакторинг");
+    expect(f.prompt_script_primary).toBe("Cyrillic");
   });
 
-  test("question count: no questions → 0", () => {
-    expect(extractUserPromptFeatures("Refactor module.").prompt_question_count).toBe(0);
+  test("Arabic script primary on Arabic prompt", () => {
+    const f = extractUserPromptFeatures("مرحبا العالم");
+    expect(f.prompt_script_primary).toBe("Arabic");
   });
 
-  test("file ref counting: multiple file extensions", () => {
-    const f = extractUserPromptFeatures("Update foo.ts, bar.py, and baz.json, also some.md");
-    expect(f.prompt_file_ref_count).toBe(4);
+  test("mixed-script prompt reports script_count >= 2", () => {
+    const f = extractUserPromptFeatures("Hello мир");
+    expect(f.prompt_script_count).toBeGreaterThanOrEqual(2);
   });
 
-  test("file ref counting: ignores plain words without extension", () => {
-    const f = extractUserPromptFeatures("Refactor the auth module please.");
-    expect(f.prompt_file_ref_count).toBe(0);
+  test("question_glyph_count counts ASCII + fullwidth + Arabic variants", () => {
+    expect(extractUserPromptFeatures("Why?").prompt_question_glyph_count).toBe(1);
+    expect(extractUserPromptFeatures("為什麼？").prompt_question_glyph_count).toBe(1);
+    expect(extractUserPromptFeatures("لماذا؟").prompt_question_glyph_count).toBe(1);
+    expect(extractUserPromptFeatures("Why? Why？ Why؟").prompt_question_glyph_count).toBe(3);
   });
 
-  test("path ref counting: src/ + tests/ + docs/", () => {
-    const f = extractUserPromptFeatures("Look in src/foo/bar.ts and tests/x.test.ts and docs/readme.md");
-    expect(f.prompt_path_ref_count).toBeGreaterThanOrEqual(3);
+  test("uppercase_ratio computed over letters only (digits/punct ignored)", () => {
+    expect(extractUserPromptFeatures("ABCD efgh").prompt_uppercase_ratio).toBeCloseTo(0.5, 3);
+    expect(extractUserPromptFeatures("abcd").prompt_uppercase_ratio).toBe(0);
+    expect(extractUserPromptFeatures("ABCD").prompt_uppercase_ratio).toBe(1);
   });
 
-  test("path ref counting: ignores bare directories without trailing path chars", () => {
-    const f = extractUserPromptFeatures("Just talking about src and tests in general.");
-    expect(f.prompt_path_ref_count).toBe(0);
+  test("file_ref_count matches multi-segment paths with extension", () => {
+    expect(extractUserPromptFeatures("src/foo/bar.ts").prompt_file_ref_count).toBeGreaterThanOrEqual(1);
+    expect(extractUserPromptFeatures("no extension here").prompt_file_ref_count).toBe(0);
   });
 
-  test("emoji-only prompt → first_word is empty, length non-zero", () => {
-    const f = extractUserPromptFeatures("🎉 🚀 🐛");
-    expect(f.prompt_first_word).toBe("");
-    expect(f.prompt_length).toBeGreaterThan(0);
+  test("path_ref_count matches ./ ../ / prefixes", () => {
+    expect(extractUserPromptFeatures("./foo/bar").prompt_path_ref_count).toBeGreaterThanOrEqual(1);
+    expect(extractUserPromptFeatures("../up/dir").prompt_path_ref_count).toBeGreaterThanOrEqual(1);
+    expect(extractUserPromptFeatures("/abs/path").prompt_path_ref_count).toBeGreaterThanOrEqual(1);
   });
 
-  test("non-string input (defensive) → all zeros", () => {
-    // @ts-expect-error — defensive boundary
-    const f = extractUserPromptFeatures(null);
-    expect(f.prompt_length).toBe(0);
-    expect(f.prompt_first_word).toBe("");
+  test("code_block_count = floor(fence_count / 2)", () => {
+    expect(extractUserPromptFeatures("```code```").prompt_code_block_count).toBe(1);
+    expect(extractUserPromptFeatures("```a``` ```b```").prompt_code_block_count).toBe(2);
+    expect(extractUserPromptFeatures("```unpaired").prompt_code_block_count).toBe(0);
   });
 
-  test("prompt_length matches String.length (chars, not bytes)", () => {
+  test("url_count matches http(s) URLs", () => {
+    expect(extractUserPromptFeatures("see https://example.com").prompt_url_count).toBe(1);
+    expect(extractUserPromptFeatures("a http://x and https://y").prompt_url_count).toBe(2);
+    expect(extractUserPromptFeatures("no url here").prompt_url_count).toBe(0);
+  });
+
+  test("prompt_length equals JavaScript string length", () => {
     expect(extractUserPromptFeatures("hello").prompt_length).toBe(5);
     expect(extractUserPromptFeatures("şğı").prompt_length).toBe(3);
   });
 
-  test("function returns plain object, NOT a SessionEvent", () => {
-    const f = extractUserPromptFeatures("anything");
-    expect(f).not.toHaveProperty("type");
-    expect(f).not.toHaveProperty("category");
-    expect(f).not.toHaveProperty("data");
-    expect(f).not.toHaveProperty("priority");
+  test("non-string input (defensive) → safe zero shape", () => {
+    // @ts-expect-error — defensive boundary
+    const f = extractUserPromptFeatures(null);
+    expect(f.prompt_length).toBe(0);
+    expect(f.prompt_script_primary).toBeNull();
+    expect(f.prompt_word_tokens).toEqual([]);
   });
 
-  test("non-first-token content NEVER leaks into features (privacy)", () => {
-    // Per F1 §5 the first_word legitimately captures the first 32 chars of
-    // the first whitespace-separated token. Privacy is enforced at the
-    // SURFACE layer (UI/MCP), not at capture. But content past the first
-    // token must NEVER appear in the features object.
-    const sensitive = "refactor the api_key=sk-secret123 module";
-    const f = extractUserPromptFeatures(sensitive);
-    const serialized = JSON.stringify(f);
-    expect(f.prompt_first_word).toBe("refactor");
-    expect(serialized).not.toContain("sk-secret123");
-    expect(serialized).not.toContain("api_key");
+  test("no first_word field exists (per §11 spec removal)", () => {
+    const f = extractUserPromptFeatures("Refactor auth");
+    expect(f).not.toHaveProperty("prompt_first_word");
+  });
+});
+
+describe("extractUserPromptFeatures — §11 Layer 3 (prompt_word_tokens)", () => {
+  test("tokens are lowercased letter-only words ≥3 chars", () => {
+    const f = extractUserPromptFeatures("Refactor THE auth module");
+    expect(f.prompt_word_tokens).toContain("refactor");
+    expect(f.prompt_word_tokens).toContain("the");
+    expect(f.prompt_word_tokens).toContain("auth");
+    expect(f.prompt_word_tokens).toContain("module");
   });
 
-  test("first_word length cap enforced even on adversarial input", () => {
-    const longToken = "a".repeat(100);
-    const f = extractUserPromptFeatures(longToken);
-    expect(f.prompt_first_word.length).toBeLessThanOrEqual(32);
+  test("tokens deduplicated within prompt (set semantics)", () => {
+    const f = extractUserPromptFeatures("auth auth auth payments payments");
+    expect(f.prompt_word_tokens.filter((t) => t === "auth").length).toBe(1);
+    expect(f.prompt_word_tokens.filter((t) => t === "payments").length).toBe(1);
+  });
+
+  test("words shorter than 3 chars are excluded", () => {
+    const f = extractUserPromptFeatures("a bi the auth");
+    expect(f.prompt_word_tokens).not.toContain("a");
+    expect(f.prompt_word_tokens).not.toContain("bi");
+    expect(f.prompt_word_tokens).toContain("the");
+    expect(f.prompt_word_tokens).toContain("auth");
+  });
+
+  test("non-Latin tokens carry through (Turkish, Chinese)", () => {
+    const f1 = extractUserPromptFeatures("ödeme ödeme yapılır");
+    expect(f1.prompt_word_tokens).toContain("ödeme");
+    expect(f1.prompt_word_tokens.filter((t) => t === "ödeme").length).toBe(1);
+
+    const f2 = extractUserPromptFeatures("认证 认证 测试");
+    expect(f2.prompt_word_tokens.some((t) => t.length >= 3)).toBe(false);
+  });
+
+  test("punctuation does NOT survive in tokens", () => {
+    const f = extractUserPromptFeatures("hello, world! testing.");
+    for (const t of f.prompt_word_tokens) {
+      expect(t).not.toMatch(/[,!.]/);
+    }
+  });
+
+  test("digits do NOT survive in tokens (letters-only)", () => {
+    const f = extractUserPromptFeatures("foo123 bar456");
+    for (const t of f.prompt_word_tokens) {
+      expect(t).not.toMatch(/[0-9]/);
+    }
   });
 });

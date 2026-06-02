@@ -1811,159 +1811,101 @@ export function extractUserEvents(message: string): SessionEvent[] {
 }
 
 /**
- * F1 §2 prompt-feature canonical shape — the platform persists these as
- * typed columns (prompt_length, prompt_first_word, prompt_question_count,
- * prompt_file_ref_count, prompt_path_ref_count). prompt_intent is Tier-3
- * (LLM, runs on platform side, not bridge).
+ * §11 Layer 1 + Layer 3 — multilingual prompt features.
+ *
+ * Reference: context-mode-platform/docs/prds/2026-06-insight-data-flow/
+ *   11-multilingual-prompt-algorithm.md
+ *
+ * Script-agnostic via Unicode property regex (`\p{L}`, `\p{Lu}`,
+ * `\p{Script=X}`). No per-language tables, no franc/fasttext deps.
+ * Layer 1 returns 10 numeric/string features; Layer 3 appends a
+ * `prompt_word_tokens: string[]` array for the platform's streaming
+ * word-frequency UPSERT.
+ *
+ * Privacy: features carry no prose. Layer 3 tokens are deduped
+ * letter-only words ≥3 chars; platform aggregates by (org_id, week,
+ * word) so no individual token surfaces in UI.
  */
 export interface PromptFeatures {
   prompt_length: number;
-  prompt_first_word: string;
-  prompt_question_count: number;
+  prompt_word_count: number;
+  prompt_uppercase_ratio: number;
   prompt_file_ref_count: number;
   prompt_path_ref_count: number;
+  prompt_script_primary: string | null;
+  prompt_script_count: number;
+  prompt_question_glyph_count: number;
+  prompt_code_block_count: number;
+  prompt_url_count: number;
+  prompt_word_tokens: string[];
 }
 
-const FILE_EXTENSIONS = new Set([
-  "ts", "tsx", "js", "jsx", "mjs", "cjs",
-  "py", "rb", "go", "rs", "java", "kt", "swift",
-  "md", "json", "yml", "yaml", "toml", "sql", "sh",
-]);
+const PROMPT_SCRIPT_NAMES = [
+  "Latin", "Cyrillic", "Arabic", "Han", "Hangul",
+  "Hiragana", "Katakana", "Devanagari", "Hebrew", "Thai", "Greek",
+] as const;
 
-const PATH_PREFIXES = ["src/", "tests/", "test/", "docs/", "scripts/", "hooks/", "packages/"];
+const EMPTY_PROMPT_FEATURES: PromptFeatures = {
+  prompt_length: 0,
+  prompt_word_count: 0,
+  prompt_uppercase_ratio: 0,
+  prompt_file_ref_count: 0,
+  prompt_path_ref_count: 0,
+  prompt_script_primary: null,
+  prompt_script_count: 0,
+  prompt_question_glyph_count: 0,
+  prompt_code_block_count: 0,
+  prompt_url_count: 0,
+  prompt_word_tokens: [],
+};
 
 /**
- * Algorithmic word-char predicate — `[A-Za-z0-9_-]` without regex.
- */
-function isFirstWordChar(c: number): boolean {
-  return (c >= 0x41 && c <= 0x5A) ||  // A-Z
-         (c >= 0x61 && c <= 0x7A) ||  // a-z
-         (c >= 0x30 && c <= 0x39) ||  // 0-9
-         c === 0x5F || c === 0x2D;    // _ -
-}
-
-function isPathSegmentChar(c: number): boolean {
-  return isFirstWordChar(c) || c === 0x2E || c === 0x2F; // . /
-}
-
-function isExtChar(c: number): boolean {
-  return (c >= 0x41 && c <= 0x5A) ||
-         (c >= 0x61 && c <= 0x7A) ||
-         (c >= 0x30 && c <= 0x39);
-}
-
-/**
- * Algorithmic first-word extraction — no regex.
- * Skips leading whitespace, reads while char is a word char, lowercases,
- * caps at 32 chars. Returns "" when no word chars exist (e.g., emoji-only).
- */
-function extractFirstWord(prompt: string): string {
-  let i = 0;
-  while (i < prompt.length && prompt.charCodeAt(i) <= 0x20) i++;
-
-  let end = i;
-  while (end < prompt.length && isFirstWordChar(prompt.charCodeAt(end))) end++;
-
-  if (end === i) return "";
-  return prompt.slice(i, Math.min(end, i + 32)).toLowerCase();
-}
-
-/**
- * Count `<identifier>.<ext>` references — algorithmic, no regex.
- * The `ext` must be in FILE_EXTENSIONS and the char before the identifier
- * must be a non-word char (so we don't count `xxxfoo.ts` mid-word matches).
- */
-function countFileRefs(prompt: string): number {
-  let count = 0;
-  let i = 0;
-  while (i < prompt.length) {
-    const c = prompt.charCodeAt(i);
-    const prev = i > 0 ? prompt.charCodeAt(i - 1) : 0;
-    const atWordStart = i === 0 || !isFirstWordChar(prev);
-
-    if (atWordStart && isFirstWordChar(c)) {
-      let j = i;
-      while (j < prompt.length && isFirstWordChar(prompt.charCodeAt(j))) j++;
-      if (j < prompt.length && prompt.charCodeAt(j) === 0x2E) {
-        const extStart = j + 1;
-        let k = extStart;
-        while (k < prompt.length && isExtChar(prompt.charCodeAt(k))) k++;
-        if (k > extStart) {
-          const ext = prompt.slice(extStart, k).toLowerCase();
-          const nextCode = k < prompt.length ? prompt.charCodeAt(k) : 0;
-          const boundary = k >= prompt.length || !isFirstWordChar(nextCode);
-          if (boundary && FILE_EXTENSIONS.has(ext)) {
-            count++;
-            i = k;
-            continue;
-          }
-        }
-      }
-      i = j;
-    } else {
-      i++;
-    }
-  }
-  return count;
-}
-
-/**
- * Count path references prefixed by one of PATH_PREFIXES with at least one
- * additional path segment character. Algorithmic, no regex.
- */
-function countPathRefs(prompt: string): number {
-  let count = 0;
-  for (const prefix of PATH_PREFIXES) {
-    let start = 0;
-    while (true) {
-      const idx = prompt.indexOf(prefix, start);
-      if (idx < 0) break;
-      const prev = idx > 0 ? prompt.charCodeAt(idx - 1) : 0;
-      const atWordStart = idx === 0 || !isFirstWordChar(prev);
-      const afterIdx = idx + prefix.length;
-      const hasTail = afterIdx < prompt.length && isPathSegmentChar(prompt.charCodeAt(afterIdx));
-      if (atWordStart && hasTail) count++;
-      start = afterIdx;
-    }
-  }
-  return count;
-}
-
-function countQuestionMarks(prompt: string): number {
-  let count = 0;
-  for (let i = 0; i < prompt.length; i++) {
-    if (prompt.charCodeAt(i) === 0x3F) count++;
-  }
-  return count;
-}
-
-/**
- * Privacy-aware prompt-feature extractor (Issue #9, F1 §2 canonical shape).
- *
- * Returns the 5-field PromptFeatures object — platform persists these as
- * typed columns. The raw prompt text is NEVER copied into the returned
- * object. Hook callers attach the returned features to the existing
- * user_prompt event payload alongside the raw `data` field.
- *
- * Algorithmic implementation (no regex) — see helpers above.
+ * Verbatim mirror of §11 Layer 1 reference implementation + Layer 3
+ * token extraction. Uses Unicode property regex per the spec — the
+ * "no regex" project default does NOT apply here because the spec
+ * explicitly mandates `\p{Script=X}` for script-agnostic classification.
  */
 export function extractUserPromptFeatures(prompt: unknown): PromptFeatures {
   if (typeof prompt !== "string" || prompt.length === 0) {
-    return {
-      prompt_length: 0,
-      prompt_first_word: "",
-      prompt_question_count: 0,
-      prompt_file_ref_count: 0,
-      prompt_path_ref_count: 0,
-    };
+    return { ...EMPTY_PROMPT_FEATURES, prompt_word_tokens: [] };
+  }
+
+  const letters = prompt.match(/\p{L}+/gu) ?? [];
+  const upperCount = (prompt.match(/\p{Lu}/gu) ?? []).length;
+  const totalLetters = letters.join("").length;
+  const fences = (prompt.match(/```/g) ?? []).length;
+
+  const scripts: Record<string, number> = {};
+  for (const name of PROMPT_SCRIPT_NAMES) {
+    const re = new RegExp(`\\p{Script=${name}}`, "gu");
+    const n = (prompt.match(re) ?? []).length;
+    if (n > 0) scripts[name] = n;
+  }
+  const primary =
+    Object.entries(scripts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const word of letters) {
+    if (word.length < 3) continue;
+    const lower = word.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    tokens.push(lower);
   }
 
   return {
     prompt_length: prompt.length,
-    prompt_first_word: extractFirstWord(prompt),
-    prompt_question_count: countQuestionMarks(prompt),
-    prompt_file_ref_count: countFileRefs(prompt),
-    prompt_path_ref_count: countPathRefs(prompt),
+    prompt_word_count: letters.length,
+    prompt_uppercase_ratio: totalLetters === 0 ? 0 : upperCount / totalLetters,
+    prompt_file_ref_count: (prompt.match(/(\w+\/)+\w+\.\w+/g) ?? []).length,
+    prompt_path_ref_count: (prompt.match(/\.{0,2}\/[\w\/.-]+/g) ?? []).length,
+    prompt_script_primary: primary,
+    prompt_script_count: Object.keys(scripts).length,
+    prompt_question_glyph_count: (prompt.match(/[?？؟]/gu) ?? []).length,
+    prompt_code_block_count: Math.floor(fences / 2),
+    prompt_url_count: (prompt.match(/https?:\/\/[^\s]+/gu) ?? []).length,
+    prompt_word_tokens: tokens,
   };
 }
 
